@@ -33,7 +33,8 @@
     'website': "https://github.com/rida-louchachha",
     'depends': ['base_setup', 'hr_attendance'],
     'external_dependencies': {
-        'python': ['pyzk'], },
+        'python': ['pyzk'],
+    },
     'data': [
         'security/ir.model.access.csv',
         'views/biometric_device_details_views.xml',
