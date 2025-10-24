@@ -1,58 +1,128 @@
-<?xml version="1.0" encoding="UTF-8" ?>
+<?xml version="1.0" encoding="UTF-8"?>
 <odoo>
-    <!--Biometric device configuration list view-->
-    <record id="biometric_device_details_view_list" model="ir.ui.view">
-        <field name="name">biometric.device.details.view.list</field>
+
+    <!-- ===================== List view ===================== -->
+    <record id="biometric_device_details_view_list_admin" model="ir.ui.view">
+        <field name="name">biometric.device.details.view.list.admin</field>
         <field name="model">biometric.device.details</field>
+        <!-- Limit this view to Administrators -->
+        <field name="groups_id" eval="[(6, 0, [ref('base.group_system')])]"/>
+        <field name="priority" eval="20"/>
         <field name="arch" type="xml">
-            <list>
+            <list string="Biometric Devices" create="1" edit="1" delete="1">
                 <field name="name"/>
                 <field name="device_ip"/>
                 <field name="port_number"/>
+                <field name="working_address"/>
             </list>
         </field>
     </record>
-    <!--Biometric device configuration form view-->
+
+    <!-- ===== User list: read-only ===== -->
+    <record id="biometric_device_details_view_list_user" model="ir.ui.view">
+        <field name="name">biometric.device.details.view.list.user</field>
+        <field name="model">biometric.device.details</field>
+        <!-- Limit to internal users (everyone except portal/public).
+             You can omit groups_id to make it global; keeping it explicit avoids ambiguity. -->
+        <field name="groups_id" eval="[(6, 0, [ref('base.group_user')])]"/>
+        <field name="priority" eval="10"/>
+        <field name="arch" type="xml">
+            <list string="Biometric Devices" create="0" edit="0" delete="0">
+                <field name="name"/>
+                <field name="device_ip"/>
+                <field name="port_number"/>
+                <field name="working_address"/>
+            </list>
+        </field>
+    </record>
+    <!-- ===================== Search view ===================== -->
+    <record id="biometric_device_details_view_search" model="ir.ui.view">
+        <field name="name">biometric.device.details.view.search</field>
+        <field name="model">biometric.device.details</field>
+        <field name="arch" type="xml">
+            <search string="Search Devices">
+                <field name="name" filter_domain="[('name','ilike',self)]"/>
+                <field name="device_ip" filter_domain="[('device_ip','ilike',self)]"/>
+                <field name="port_number"/>
+                <field name="working_address"/>
+                <separator/>
+                <filter string="Port 4370" name="port_4370" domain="[('port_number','=',4370)]"/>
+            </search>
+        </field>
+    </record>
+
+    <!-- ===================== Form view ===================== -->
     <record id="biometric_device_details_view_form" model="ir.ui.view">
         <field name="name">biometric.device.details.view.form</field>
         <field name="model">biometric.device.details</field>
         <field name="arch" type="xml">
-            <form>
+            <form string="Biometric Device">
                 <header>
-                    <button name="action_set_timezone" string=" Set Time"
-                            type="object" class="oe_highlight"/>
+                    <button name="action_test_connection"
+                            string="Test Connection"
+                            type="object"
+                            class="btn-secondary"
+                            invisible="not device_ip"
+                            groups="base.group_system"/>
+                    <button name="action_set_timezone"
+                            string="Set Time"
+                            type="object"
+                            class="oe_highlight"
+                            invisible="not device_ip"/>
                     <button name="action_download_attendance"
                             string="Download Data"
-                            type="object" class="oe_highlight"/>
-                    <button name="action_clear_attendance" string="Clear Data"
-                            type="object" class="oe_highlight"
-                            confirm="Are you sure you want to clear all
-                            attendance records from the Device and Odoo?"/>
-                    <button name="action_restart_device" string="Restart"
-                            type="object" class="oe_highlight"
-                            confirm="Are you sure you want Restart the Biometric
-                            Device?"/>
+                            type="object"
+                            class="oe_highlight"
+                            invisible="not device_ip"
+                            groups="base.group_system"/>
+                    <button name="action_clear_attendance"
+                            string="Clear Data"
+                            type="object"
+                            class="btn-danger"
+                            confirm="Are you sure you want to clear all attendance records from the device and from Odoo? This cannot be undone."
+                            invisible="not device_ip"
+                            groups="base.group_system"/>
+                    <button name="action_restart_device"
+                            string="Restart Device"
+                            type="object"
+                            class="btn-secondary"
+                            confirm="Are you sure you want to restart the biometric device?"
+                            invisible="not device_ip"
+                            groups="base.group_system"/>
                 </header>
+
                 <sheet>
                     <group>
-                        <field name="name"/>
-                        <field name="device_ip"/>
-                        <field name="port_number"/>
-                        <field name="address_id"/>
+                        <group string="Device">
+                            <field name="name"/>
+                            <field name="working_address"/>
+                        </group>
+                        <group string="Connectivity">
+                            <field name="device_ip" placeholder="e.g. 192.168.1.60" required="1"/>
+                            <field name="port_number" placeholder="4370"/>
+                            <field name="device_password" string="Comm Key / Password" placeholder="0 (default)"/>
+                        </group>
                     </group>
-                    <button name="action_test_connection"
-                            type="object" class="btn btn-secondary">
-                        <i class="fa fa-fw o_button_icon fa-television"/>
-                        Test Connection
-                    </button>
+
+                    <separator string="Usage tips"/>
+                    <div class="o_form_label">Usage tips</div>
+                    <div class="o_form_note">
+                        • Use <b>Test Connection</b> first. <br/>
+                        • <b>Set Time</b> pushes your Odoo user's local time to the device. <br/>
+                        • <b>Download Data</b> pulls logs into Odoo. <br/>
+                        • <b>Clear Data</b> will erase logs on the device and in Odoo's raw table.
+                    </div>
                 </sheet>
             </form>
         </field>
     </record>
-    <!--	Action for the biometric device-->
+
+    <!-- ===================== Action ===================== -->
     <record id="biometric_device_details_action" model="ir.actions.act_window">
-        <field name="name">Biometric Device</field>
+        <field name="name">Biometric Devices</field>
         <field name="res_model">biometric.device.details</field>
         <field name="view_mode">list,form</field>
+        <!-- Odoo auto-picks the proper list view by group; no need to hard-wire view_ids -->
     </record>
+
 </odoo>

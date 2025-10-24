@@ -1,415 +1,373 @@
 # -*- coding: utf-8 -*-
-################################################################################
-#
-#    louchachha Technologies Pvt. Ltd.
-#    Copyright (C) 2025-TODAY louchachha Technologies(<https://github.com/rida-louchachha>).
-#    Author: rida louchachha (https://github.com/rida-louchachha)
-#
-#    This program is free software: you can modify
-#    it under the terms of the GNU Affero General Public License (AGPL) as
-#    published by the Free Software Foundation, either version 3 of the
-#    License, or (at your option) any later version.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU Affero General Public License for more details.
-#
-#    You should have received a copy of the GNU Affero General Public License
-#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-################################################################################
 import datetime
 import logging
-import subprocess
-import sys
 import pytz
+
 from odoo import api, fields, models, _
 from odoo.exceptions import UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
-
-# Force import with installation attempt
-def install_pyzk():
-    """Install pyzk library if not available"""
-    try:
-        from zk import ZK, const
-        return True, None
-    except ImportError:
-        _logger.warning("pyzk library not found. Attempting to install...")
-        try:
-            # Try to install pyzk
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "pyzk"])
-            _logger.info("pyzk library installed successfully")
-            # Try import again
-            from zk import ZK, const
-            return True, None
-        except subprocess.CalledProcessError:
-            error_msg = "Failed to install pyzk automatically. Please install manually using: pip install pyzk"
-            _logger.error(error_msg)
-            return False, error_msg
-        except ImportError:
-            error_msg = "pyzk installation failed. Please install manually using: pip install pyzk"
-            _logger.error(error_msg)
-            return False, error_msg
-
-
-# Attempt to install and import
-ZK_IMPORTED, IMPORT_ERROR = install_pyzk()
-
-if ZK_IMPORTED:
-    from zk import ZK, const
-else:
-    _logger.error("Pyzk library not available: %s", IMPORT_ERROR)
+# Try to import pyzk once, fail gracefully with a clear message.
+try:
+    from zk import ZK, const  # noqa: F401
+    _ZK_AVAILABLE = True
+    _ZK_ERROR = None
+except Exception as e:  # ImportError or anything environment-related
+    _ZK_AVAILABLE = False
+    _ZK_ERROR = str(e)
 
 
 class BiometricDeviceDetails(models.Model):
-    """Model for configuring and connect the biometric device with odoo"""
-    _name = 'biometric.device.details'
-    _description = 'Biometric Device Details'
+    """Configuration and operations for a ZKTeco device."""
+    _name = "biometric.device.details"
+    _description = "Biometric Device Details"
 
-    name = fields.Char(string='Name', required=True, help='Record Name')
-    device_ip = fields.Char(string='Device IP', required=True,
-                            help='The IP address of the Device')
-    port_number = fields.Integer(string='Port Number', required=True,
-                                 help="The Port Number of the Device")
-    address_id = fields.Many2one('res.partner', string='Working Address',
-                                 help='Working address of the partner')
-    company_id = fields.Many2one('res.company', string='Company',
-                                 default=lambda self: self.env.user.company_id.id,
-                                 help='Current Company')
+    # ---- Config fields ----
+    name = fields.Char(required=True)
+    device_ip = fields.Char(required=True)
+    port_number = fields.Integer(default=4370)
+    working_address = fields.Many2one('res.partner', string="Working Address")
+    device_password = fields.Integer(string="Comm Key / Password", default=0)
 
-    def _check_zk_import(self):
-        """Check if pyzk is installed and available"""
-        if not ZK_IMPORTED:
+    auto_sync = fields.Boolean(string="Auto Sync", default=True, help="Include this device in the scheduler download.")
+    last_sync_at = fields.Datetime(string="Last Sync", readonly=True)
+
+    # Optional: keep time aligned from user/device TZ if you like
+    # device_tz = fields.Char(string="Device Timezone", default="UTC")
+
+    # ---- Internal helpers ----
+    def _require_zk(self):
+        """Ensure pyzk is installed in the server environment."""
+        if not _ZK_AVAILABLE:
             raise UserError(_(
-                "Pyzk module is required but not available.\n\n"
-                "Please install it manually using:\n"
-                "pip install pyzk\n\n"
-                "Or contact your system administrator to install this Python library."
-            ))
+                "Missing Python library 'pyzk'. "
+                "Ask your administrator to install it (pip install pyzk).\n\nDetails: %s"
+            ) % _ZK_ERROR)
 
     def _safe_disconnect(self, conn):
-        """Safely disconnect from device without raising errors"""
+        """Disconnect without raising if the connection is already closed/broken."""
         try:
-            if conn and hasattr(conn, 'disconnect'):
+            if conn and hasattr(conn, "disconnect"):
                 conn.disconnect()
-                _logger.info("Device disconnected successfully")
         except Exception as e:
             _logger.warning("Safe disconnect failed: %s", e)
-            # Ignore disconnect errors as they're not critical
 
-    def device_connect(self, zk):
-        """Function for connecting the device with Odoo"""
-        self._check_zk_import()
-        try:
-            conn = zk.connect()
-            return conn
-        except Exception as e:
-            _logger.error("Device connection error: %s", e)
-            return False
+    def _connect(self):
+        """Create a ZK connection using current record configuration."""
+        self._require_zk()
+        zk = ZK(
+            self.device_ip,
+            port=self.port_number or 4370,
+            timeout=30,
+            password=self.device_password or 0,
+            force_udp=False,
+            ommit_ping=False,
+        )
+        return zk.connect()
 
+    # ---- UI actions ----
     def action_test_connection(self):
-        """Checking the connection status"""
-        self._check_zk_import()
-
+        conn = None
         try:
-            zk = ZK(self.device_ip, port=self.port_number, timeout=30,
-                    password=False, ommit_ping=False)
-            conn = self.device_connect(zk)
-            if conn:
-                self._safe_disconnect(conn)
-                return {
-                    'type': 'ir.actions.client',
-                    'tag': 'display_notification',
-                    'params': {
-                        'message': 'Successfully Connected to Biometric Device',
-                        'type': 'success',
-                        'sticky': False
-                    }
-                }
-            else:
-                raise ValidationError(_('Unable to connect to the biometric device. '
-                                        'Please check the IP address and port number.'))
-        except Exception as error:
-            _logger.error("Connection test failed: %s", error)
-            raise ValidationError(_('Connection failed: %s') % error)
+            conn = self._connect()
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {
+                    "message": _("Successfully Connected to Biometric Device"),
+                    "type": "success",
+                    "sticky": False,
+                },
+            }
+        except Exception as e:
+            raise ValidationError(_("Connection failed: %s") % e)
+        finally:
+            self._safe_disconnect(conn)
 
     def action_set_timezone(self):
-        """Function to set user's timezone to device"""
-        self._check_zk_import()
-
-        for info in self:
-            machine_ip = info.device_ip
-            zk_port = info.port_number
-            conn = None
-            try:
-                zk = ZK(machine_ip, port=zk_port, timeout=15,
-                        password=0, force_udp=False, ommit_ping=False)
-                conn = self.device_connect(zk)
-                if conn:
-                    user_tz = self.env.context.get('tz') or self.env.user.tz or 'UTC'
-                    user_timezone_time = pytz.utc.localize(fields.Datetime.now())
-                    user_timezone_time = user_timezone_time.astimezone(
-                        pytz.timezone(user_tz))
-                    conn.set_time(user_timezone_time)
-                    return {
-                        'type': 'ir.actions.client',
-                        'tag': 'display_notification',
-                        'params': {
-                            'message': 'Successfully Set the Device Time',
-                            'type': 'success',
-                            'sticky': False
-                        }
-                    }
-                else:
-                    raise UserError(_("Cannot connect to device. Please check connection and try again."))
-            except Exception as e:
-                _logger.error("Timezone setting failed: %s", e)
-                raise UserError(_("Failed to set device timezone: %s") % e)
-            finally:
-                # Always try to disconnect
-                self._safe_disconnect(conn)
+        """Push the current user's local time to the device."""
+        conn = None
+        try:
+            conn = self._connect()
+            user_tz = self.env.user.tz or "UTC"
+            now_utc = fields.Datetime.now()  # naive UTC in Odoo
+            # Make timezone-aware in UTC, then convert to user's TZ
+            current = pytz.utc.localize(now_utc).astimezone(pytz.timezone(user_tz))
+            conn.set_time(current)
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {
+                    "message": _("Successfully set the device time"),
+                    "type": "success",
+                    "sticky": False,
+                },
+            }
+        except Exception as e:
+            raise UserError(_("Failed to set device timezone: %s") % e)
+        finally:
+            self._safe_disconnect(conn)
 
     def action_clear_attendance(self):
-        """Method to clear record from the zk.machine.attendance model and from the device"""
-        self._check_zk_import()
-        for info in self:
-            conn = None
-            try:
-                machine_ip = info.device_ip
-                zk_port = info.port_number
+        """Clear logs on device and raw table in Odoo."""
+        conn = None
+        try:
+            conn = self._connect()
+            has_data = bool(conn.get_attendance())
+            if has_data:
+                conn.clear_attendance()
+                self.env.cr.execute("DELETE FROM zk_machine_attendance")
+                msg, t = _("Attendance data cleared successfully"), "success"
+            else:
+                msg, t = _("No attendance data found to clear"), "warning"
 
-                zk = ZK(machine_ip, port=zk_port, timeout=30,
-                        password=0, force_udp=False, ommit_ping=False)
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {"message": msg, "type": t, "sticky": False},
+            }
+        except Exception as e:
+            raise ValidationError(_("Failed to clear attendance: %s") % e)
+        finally:
+            self._safe_disconnect(conn)
 
-                conn = self.device_connect(zk)
-                if conn:
-                    conn.enable_device()
-                    clear_data = conn.get_attendance()
-                    if clear_data:
-                        # Clearing data in the device
-                        conn.clear_attendance()
-                        # Clearing data from attendance log
-                        self._cr.execute("""delete from zk_machine_attendance""")
-                        return {
-                            'type': 'ir.actions.client',
-                            'tag': 'display_notification',
-                            'params': {
-                                'message': 'Attendance data cleared successfully',
-                                'type': 'success',
-                                'sticky': False
-                            }
-                        }
-                    else:
-                        return {
-                            'type': 'ir.actions.client',
-                            'tag': 'display_notification',
-                            'params': {
-                                'message': 'No attendance data found to clear',
-                                'type': 'warning',
-                                'sticky': False
-                            }
-                        }
-                else:
-                    raise UserError(
-                        _('Unable to connect to Attendance Device. Please use '
-                          'Test Connection button to verify.'))
-            except Exception as error:
-                _logger.error("Clear attendance failed: %s", error)
-                raise ValidationError(_('Failed to clear attendance: %s') % error)
-            finally:
-                self._safe_disconnect(conn)
+    def _resolve_employee_for_log(self, log_user_id: int, users_map: dict):
+        """
+        1) Match hr.employee by device_id_num == log_user_id
+        2) Else match by device user name (exact, case-insensitive). If one match:
+             set employee.device_id_num = log_user_id
+        3) Else match by unique ilike name; if one:
+             set employee.device_id_num = log_user_id
+        4) Else create a new employee with that name and device_id_num
+        """
+        HrEmployee = self.env['hr.employee'].sudo()
+
+        # 1) direct match
+        emp = HrEmployee.search([('device_id_num', '=', str(log_user_id))], limit=1)
+        if emp:
+            return emp
+
+        dev_user = users_map.get(log_user_id)
+        dev_name = (dev_user and (dev_user.name or '').strip()) or ''
+
+        if dev_name:
+            # 2) exact case-insensitive
+            candidates = HrEmployee.search([('name', 'ilike', dev_name)], limit=10)
+            exact = [e for e in candidates if (e.name or '').strip().casefold() == dev_name.casefold()]
+            if len(exact) == 1:
+                emp = exact[0]
+                if not emp.device_id_num:
+                    emp.write({'device_id_num': str(log_user_id)})
+                return emp
+
+            # 3) unique ilike
+            if not exact and len(candidates) == 1:
+                emp = candidates[0]
+                if not emp.device_id_num:
+                    emp.write({'device_id_num': str(log_user_id)})
+                return emp
+
+        # 4) create
+        return HrEmployee.create({
+            'name': dev_name or str(log_user_id),
+            'device_id_num': str(log_user_id),
+        })
 
     @api.model
     def cron_download(self):
-        """Cron method to download attendance from all machines"""
-        if not ZK_IMPORTED:
-            _logger.error("Pyzk not available. Skipping attendance download.")
+        """Run auto-sync for all enabled devices in a single recordset call."""
+        if not _ZK_AVAILABLE:
+            _logger.error("pyzk not available; skipping cron_download. Details: %s", _ZK_ERROR)
             return
-
-        machines = self.env['biometric.device.details'].search([])
-        for machine in machines:
-            try:
-                machine.action_download_attendance()
-            except Exception as e:
-                _logger.error("Failed to download attendance from machine %s: %s", machine.name, e)
+        devices = self.search([('auto_sync', '=', True)])
+        if devices:
+            devices.with_context(from_cron=True).action_download_attendance()
 
     def action_download_attendance(self):
-        """Function to download attendance records from the device"""
-        self._check_zk_import()
-        _logger.info("Downloading attendance from biometric device: %s", self.name)
+        """
+        Pull logs from device:
+        - UPSERT raw rows in zk.machine.attendance (create or update if same key),
+        - create/update hr.attendance as in/out pairs (Breaks behave like check in/out),
+        - employee resolution by device_id_num -> name -> create.
+        """
+        self._require_zk()
+        ZkLog = self.env["zk.machine.attendance"].sudo()
+        HrAtt = self.env["hr.attendance"].sudo()
+        HrEmployee = self.env["hr.employee"].sudo()
 
-        zk_attendance = self.env['zk.machine.attendance']
-        hr_attendance = self.env['hr.attendance']
+        IN_CODES = {0, 3, 4}  # Check In, Break In, Overtime In
+        OUT_CODES = {1, 2, 5}  # Check Out, Break Out, Overtime Out
+        DUP_GRACE = 5  # seconds to collapse repeated same-side punches
 
-        for info in self:
-            machine_ip = info.device_ip
-            zk_port = info.port_number
-            conn = None
+        conn = None
+        try:
+            conn = self._connect()
+            conn.disable_device()
 
-            try:
-                zk = ZK(machine_ip, port=zk_port, timeout=15,
-                        password=0, force_udp=False, ommit_ping=False)
-                conn = self.device_connect(zk)
+            users = {u.user_id: u for u in (conn.get_users() or [])}
+            logs = conn.get_attendance() or []
+            if not logs:
+                return {
+                    "type": "ir.actions.client",
+                    "tag": "display_notification",
+                    "params": {"message": _("No attendance records found on the device"),
+                               "type": "warning", "sticky": False},
+                }
 
-                if not conn:
-                    raise UserError(
-                        _('Unable to connect to device. Please check network connection and device parameters.'))
+            DEVICE_DEFAULT_TZ = "Africa/Casablanca"
+            tzname = getattr(self, "device_tz", False) or DEVICE_DEFAULT_TZ
 
-                conn.disable_device()  # Device Cannot be used during this time.
-                users = conn.get_users()
-                attendance_data = conn.get_attendance()
+            last_in_ts, last_out_ts = {}, {}
+            count_upserted = 0
 
-                if not attendance_data:
-                    # No attendance data found - return success message instead of error
-                    return {
-                        'type': 'ir.actions.client',
-                        'tag': 'display_notification',
-                        'params': {
-                            'message': 'No attendance records found on the device',
-                            'type': 'warning',
-                            'sticky': False
-                        }
-                    }
+            for log in logs:
+                # ----- time (device local -> UTC) -----
+                try:
+                    dev_tz = pytz.timezone(tzname)
+                except Exception:
+                    dev_tz = pytz.timezone(DEVICE_DEFAULT_TZ)
+                local_dt = dev_tz.localize(log.timestamp, is_dst=None)
+                utc_dt = local_dt.astimezone(pytz.utc)
+                ts = fields.Datetime.to_string(utc_dt)
+                ts_dt = fields.Datetime.to_datetime(ts)
 
-                attendance_count = 0
-                for attendance in attendance_data:
-                    atten_time = attendance.timestamp
-                    local_tz = pytz.timezone(
-                        self.env.user.partner_id.tz or 'GMT')
-                    local_dt = local_tz.localize(atten_time, is_dst=None)
-                    utc_dt = local_dt.astimezone(pytz.utc)
-                    utc_dt = utc_dt.strftime("%Y-%m-%d %H:%M:%S")
-                    atten_time = datetime.datetime.strptime(
-                        utc_dt, "%Y-%m-%d %H:%M:%S")
-                    atten_time = fields.Datetime.to_string(atten_time)
+                # ----- raw values -----
+                att_type = str(getattr(log, "status", ""))  # finger/face/card…
+                p_type_str = str(getattr(log, "punch", ""))  # '0'..'5'
+                try:
+                    punch_code = int(p_type_str)
+                except (TypeError, ValueError):
+                    punch_code = None
 
-                    for user in users:
-                        if user.user_id == attendance.user_id:
-                            employee = self.env['hr.employee'].search(
-                                [('device_id_num', '=', attendance.user_id)])
+                # ----- employee resolution -----
+                dev_user_id_str = str(log.user_id)
+                emp = HrEmployee.search([("device_id_num", "=", dev_user_id_str)], limit=1)
+                if not emp:
+                    dev_user = users.get(log.user_id)
+                    dev_name = (dev_user and (dev_user.name or "").strip()) or ""
+                    if dev_name:
+                        emp = HrEmployee.search([("name", "=", dev_name)], limit=1) or \
+                              HrEmployee.search([("name", "ilike", dev_name)], limit=1)
+                        if emp and not emp.device_id_num:
+                            emp.write({"device_id_num": dev_user_id_str})
+                if not emp:
+                    dev_user = users.get(log.user_id)
+                    new_name = (dev_user.name if dev_user and dev_user.name else dev_user_id_str)
+                    emp = HrEmployee.create({"name": new_name, "device_id_num": dev_user_id_str})
 
-                            if not employee:
-                                # Create new employee if not found
-                                employee = self.env['hr.employee'].create({
-                                    'device_id_num': attendance.user_id,
-                                    'name': user.name
-                                })
-                                _logger.info("Created new employee: %s", user.name)
+                # ----- UPSERT raw log -----
+                raw = ZkLog.search([
+                    ("device_id_num", "=", dev_user_id_str),
+                    ("punching_time", "=", ts),
+                ], limit=1)
+                raw_vals = {
+                    "employee_id": emp.id,
+                    "device_id_num": dev_user_id_str,
+                    "punching_time": ts,
+                    "attendance_type": att_type,
+                    "punch_type": p_type_str,
+                    "punch": punch_code,
+                    "device_ref_id": self.id,
+                    "address_id": self.working_address.id if getattr(self, "working_address", False) else False,
+                }
+                (raw and raw.write(raw_vals)) or ZkLog.create(raw_vals)
 
-                            # Check for duplicate attendance
-                            duplicate_atten = zk_attendance.search([
-                                ('device_id_num', '=', attendance.user_id),
-                                ('punching_time', '=', atten_time)
-                            ])
+                # ----- hr.attendance logic (Breaks == Check Ins/Outs) -----
+                win_start = fields.Datetime.to_string(ts_dt - datetime.timedelta(seconds=DUP_GRACE))
+                win_end = fields.Datetime.to_string(ts_dt + datetime.timedelta(seconds=DUP_GRACE))
 
-                            if not duplicate_atten:
-                                # Create attendance record
-                                zk_attendance.create({
-                                    'employee_id': employee.id,
-                                    'device_id_num': attendance.user_id,
-                                    'attendance_type': str(attendance.status),
-                                    'punch_type': str(attendance.punch),
-                                    'punching_time': atten_time,
-                                    'address_id': info.address_id.id
-                                })
-                                attendance_count += 1
+                if punch_code in IN_CODES:
+                    # duplicate-IN grace
+                    li = last_in_ts.get(emp.id)
+                    if li and abs((ts_dt - li).total_seconds()) <= DUP_GRACE:
+                        _logger.debug("Skip duplicate IN (grace) for emp %s @ %s", emp.id, ts)
+                    else:
+                        # CHANGED: if an IN arrives while another IN is already open -> ignore (no split)
+                        open_att = HrAtt.search([
+                            ('employee_id', '=', emp.id),
+                            ('check_out', '=', False),
+                        ], order='check_in desc', limit=1)
 
-                                # Update HR attendance
-                                if attendance.punch == 0:  # check-in
-                                    # Check if there's already an open attendance
-                                    open_attendance = hr_attendance.search([
-                                        ('employee_id', '=', employee.id),
-                                        ('check_out', '=', False)
-                                    ], order='check_in desc', limit=1)
+                        same_in = HrAtt.search([
+                            ('employee_id', '=', emp.id),
+                            ('check_in', '>=', win_start),
+                            ('check_in', '<=', win_end),
+                        ], limit=1)
 
-                                    if not open_attendance:
-                                        hr_attendance.create({
-                                            'employee_id': employee.id,
-                                            'check_in': atten_time
-                                        })
-                                    else:
-                                        _logger.warning("Open attendance found for employee %s, skipping check-in",
-                                                        employee.name)
+                        if not open_att and not same_in:
+                            try:
+                                HrAtt.create({'employee_id': emp.id, 'check_in': ts})
+                            except ValidationError:
+                                _logger.debug("Conflicting IN for emp %s @ %s", emp.id, ts)
 
-                                elif attendance.punch == 1:  # check-out
-                                    # Find open attendance record
-                                    open_attendance = hr_attendance.search([
-                                        ('employee_id', '=', employee.id),
-                                        ('check_out', '=', False)
-                                    ], order='check_in desc', limit=1)
+                    last_in_ts[emp.id] = ts_dt
 
-                                    if open_attendance:
-                                        open_attendance.write({
-                                            'check_out': atten_time
-                                        })
-                                    else:
-                                        # Create check-in/check-out pair if no open record found
-                                        hr_attendance.create({
-                                            'employee_id': employee.id,
-                                            'check_in': atten_time,
-                                            'check_out': atten_time
-                                        })
-                                        _logger.warning(
-                                            "No open attendance found for employee %s, created check-in/out pair",
-                                            employee.name)
+                elif punch_code in OUT_CODES:
+                    # duplicate-OUT grace
+                    lo = last_out_ts.get(emp.id)
+                    if lo and abs((ts_dt - lo).total_seconds()) <= DUP_GRACE:
+                        _logger.debug("Skip duplicate OUT (grace) for emp %s @ %s", emp.id, ts)
+                    else:
+                        open_att = HrAtt.search([
+                            ('employee_id', '=', emp.id),
+                            ('check_out', '=', False),
+                        ], order='check_in desc', limit=1)
 
-                _logger.info("Successfully downloaded %s attendance records", attendance_count)
+                        if open_att:
+                            if not (open_att.check_out and win_start <= fields.Datetime.to_string(
+                                    open_att.check_out) <= win_end):
+                                if not open_att.check_in or ts_dt >= open_att.check_in:
+                                    try:
+                                        open_att.write({'check_out': ts})
+                                    except ValidationError:
+                                        _logger.debug("Conflicting OUT for emp %s @ %s", emp.id, ts)
+                        else:
+                            # CHANGED: do NOT create zero-length pairs for stray OUTs
+                            _logger.debug("Stray OUT for emp %s @ %s -> ignored (no open IN).", emp.id, ts)
 
-                if attendance_count > 0:
-                    return {
-                        'type': 'ir.actions.client',
-                        'tag': 'display_notification',
-                        'params': {
-                            'message': f'Successfully downloaded {attendance_count} attendance records',
-                            'type': 'success',
-                            'sticky': False
-                        }
-                    }
-                else:
-                    return {
-                        'type': 'ir.actions.client',
-                        'tag': 'display_notification',
-                        'params': {
-                            'message': 'No new attendance records found to download',
-                            'type': 'warning',
-                            'sticky': False
-                        }
-                    }
+                    last_out_ts[emp.id] = ts_dt
 
-            except Exception as e:
-                _logger.error("Attendance download failed: %s", e)
-                raise UserError(_('Error downloading attendance: %s') % e)
-            finally:
-                # Always try to disconnect, even if there's an error
-                self._safe_disconnect(conn)
+                count_upserted += 1
+
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {
+                    "message": _("Download complete. Upserted %s records.") % count_upserted,
+                    "type": "success" if count_upserted else "warning",
+                    "sticky": False,
+                },
+            }
+
+        except ValidationError as ve:
+            _logger.info("Attendance duplicates/overlaps skipped: %s", ve)
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {"message": _("Attendance download completed (duplicates skipped)."),
+                           "type": "success", "sticky": False},
+            }
+        except Exception as e:
+            raise UserError(_("Error downloading attendance: %s") % e)
+        finally:
+            self._safe_disconnect(conn)
 
     def action_restart_device(self):
-        """For restarting the device"""
-        self._check_zk_import()
         conn = None
-
         try:
-            zk = ZK(self.device_ip, port=self.port_number, timeout=15,
-                    password=0, force_udp=False, ommit_ping=False)
-            conn = self.device_connect(zk)
-            if conn:
-                conn.restart()
-                return {
-                    'type': 'ir.actions.client',
-                    'tag': 'display_notification',
-                    'params': {
-                        'message': 'Device restart command sent successfully',
-                        'type': 'success',
-                        'sticky': False
-                    }
-                }
-            else:
-                raise UserError(_("Unable to connect to device"))
+            conn = self._connect()
+            conn.restart()
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {
+                    "message": _("Device restart command sent successfully"),
+                    "type": "success",
+                    "sticky": False,
+                },
+            }
         except Exception as e:
-            _logger.error("Device restart failed: %s", e)
             raise UserError(_("Failed to restart device: %s") % e)
         finally:
             self._safe_disconnect(conn)

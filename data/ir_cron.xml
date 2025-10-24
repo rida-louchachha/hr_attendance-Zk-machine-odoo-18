@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <record id="ir_cron_zk_auto_download" model="ir.cron">
+        <field name="name">ZKTeco Auto Download</field>
+        <field name="model_id" ref="model_biometric_device_details"/>
+        <field name="state">code</field>
+        <field name="code">model.cron_download()</field>
+        <field name="interval_type">minutes</field>
+        <field name="interval_number">1</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="active">True</field>
+        <field name="nextcall" eval="DateTime.now()"/>
+    </record>
+</odoo>

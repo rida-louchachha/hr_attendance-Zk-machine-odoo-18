@@ -1,25 +1,84 @@
-<?xml version="1.0" encoding="UTF-8" ?>
+<?xml version="1.0" encoding="UTF-8"?>
 <odoo>
-    <!--    Daily attendance list view-->
-    <record id="daily_attendance_view_list" model="ir.ui.view">
-        <field name="name">daily.attendance.view.list</field>
+
+    <!-- ===================== Tree (read-only) ===================== -->
+    <record id="daily_attendance_view_tree" model="ir.ui.view">
+        <field name="name">daily.attendance.view.tree</field>
         <field name="model">daily.attendance</field>
         <field name="arch" type="xml">
-            <list string="Attendance" create="false" delete="false">
-                <field name="punching_day"/>
+            <list string="Daily Attendance" create="0" edit="1" delete="1">
+                <field name="punching_time"/>
                 <field name="employee_id"/>
                 <field name="punch_type"/>
                 <field name="attendance_type"/>
-                <field name="punching_time"/>
                 <field name="address_id"/>
+                <field name="punching_day" invisible="1"/>
             </list>
         </field>
     </record>
-    <!--    Attendance analysis action-->
+
+    <!-- ===================== Search ===================== -->
+    <record id="daily_attendance_view_search" model="ir.ui.view">
+        <field name="name">daily.attendance.view.search</field>
+        <field name="model">daily.attendance</field>
+        <field name="arch" type="xml">
+            <search string="Search Attendance">
+                <field name="employee_id"/>
+                <field name="attendance_type"/>
+                <field name="punch_type"/>
+                <field name="address_id"/>
+                <!-- Date filter by punch time (primary) -->
+                <filter string="Today" name="today" domain="[('punching_time','&gt;=', context_today().strftime('%%Y-%%m-%%d 00:00:00')), ('punching_time','&lt;', context_today().strftime('%%Y-%%m-%%d 23:59:59'))]"/>
+                <filter string="This Week" name="this_week" domain="[('punching_time','&gt;=', (context_today() - datetime.timedelta(days=context_today().weekday())).strftime('%%Y-%%m-%%d 00:00:00'))]"/>
+                <separator/>
+                <filter string="Check In" name="only_in" domain="[('punch_type','=','0')]"/>
+                <filter string="Check Out" name="only_out" domain="[('punch_type','=','1')]"/>
+            </search>
+        </field>
+    </record>
+
+    <!-- ===================== Graph (optional) ===================== -->
+    <record id="daily_attendance_view_graph" model="ir.ui.view">
+        <field name="name">daily.attendance.view.graph</field>
+        <field name="model">daily.attendance</field>
+        <field name="arch" type="xml">
+            <graph string="Attendance (Counts)" type="bar">
+                <field name="employee_id" type="row"/>
+                <field name="punching_time" type="col" interval="day"/>
+                <field name="id" type="measure"/>
+            </graph>
+        </field>
+    </record>
+
+    <!-- ===================== Pivot (optional) ===================== -->
+    <record id="daily_attendance_view_pivot" model="ir.ui.view">
+        <field name="name">daily.attendance.view.pivot</field>
+        <field name="model">daily.attendance</field>
+        <field name="arch" type="xml">
+            <pivot string="Attendance Pivot">
+                <field name="employee_id" type="row"/>
+                <field name="punch_type" type="row"/>
+                <field name="punching_time" type="col" interval="day"/>
+                <field name="id" type="measure"/>
+            </pivot>
+        </field>
+    </record>
+
+    <!-- ===================== Action ===================== -->
     <record id="daily_attendance_action" model="ir.actions.act_window">
         <field name="name">Attendance Analysis</field>
         <field name="res_model">daily.attendance</field>
-        <field name="view_mode">list</field>
+        <field name="view_mode">list,graph,pivot</field>
+        <field name="search_view_id" ref="daily_attendance_view_search"/>
         <field name="context">{}</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">
+                No attendance lines yet
+            </p>
+            <p>
+                Use <em>Devices → Download Data</em> to pull punches from your ZKTeco terminals.
+            </p>
+        </field>
     </record>
+
 </odoo>
