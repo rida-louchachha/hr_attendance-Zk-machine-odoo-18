@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+  <!-- Everyone can read -->
+  <record id="zk_raw_read_all" model="ir.rule">
+    <field name="name">ZK Raw read</field>
+    <field name="model_id" ref="model_zk_machine_attendance"/>
+    <field name="domain_force">[(1,'=',1)]</field>
+    <field name="groups" eval="[(4, ref('base.group_user'))]"/>
+  </record>
+
+  <!-- ADMIN: full domain -->
+  <record id="zk_raw_admin_all" model="ir.rule">
+    <field name="name">ZK Raw admin all</field>
+    <field name="model_id" ref="model_zk_machine_attendance"/>
+    <field name="domain_force">[(1,'=',1)]</field>
+    <field name="groups" eval="[(4, ref('base.group_system'))]"/>
+  </record>
+</odoo>

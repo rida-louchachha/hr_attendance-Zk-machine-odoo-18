@@ -37,6 +37,8 @@
     },
     'data': [
         'security/ir.model.access.csv',
+        'security/zk_rules.xml',
+        'data/ir_cron.xml',
         'views/biometric_device_details_views.xml',
         'views/hr_employee_views.xml',
         'views/daily_attendance_views.xml',
