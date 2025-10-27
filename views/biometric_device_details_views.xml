@@ -89,6 +89,14 @@
                             confirm="Are you sure you want to restart the biometric device?"
                             invisible="not device_ip"
                             groups="base.group_system"/>
+
+                    <button name="action_open_device_users"
+                            type="object"
+                            class="btn-secondary"
+                            string="Device Users"
+                            groups="base.group_system"
+                            invisible="not device_ip"/>
+
                 </header>
 
                 <sheet>
