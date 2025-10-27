@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+
+  <!-- Tree -->
+  <record id="biometric_device_user_tree" model="ir.ui.view">
+    <field name="name">biometric.device.user.tree</field>
+    <field name="model">biometric.device.user</field>
+    <field name="arch" type="xml">
+      <list string="Device Users" create="1" edit="1" delete="1"
+            decoration-success="sync_state == 'synced'"
+            decoration-warning="sync_state == 'unknown'"
+            decoration-danger="sync_state == 'needs_push'"
+      >
+        <field name="sync_state"/>
+        <field name="device_id"/>
+        <field name="user_id"/>
+        <field name="name"/>
+        <field name="privilege"/>
+        <field name="card_no"/>
+        <field name="enabled"/>
+        <field name="fingerprint_count"/>
+        <field name="face_count"/>
+        <field name="last_seen"/>
+      </list>
+    </field>
+  </record>
+
+  <!-- Search -->
+<record id="biometric_device_user_search" model="ir.ui.view">
+  <field name="name">biometric.device.user.search</field>
+  <field name="model">biometric.device.user</field>
+  <field name="arch" type="xml">
+    <search string="Search Users">
+      <field name="name" filter_domain="[('name','ilike',self)]"/>
+      <field name="user_id" filter_domain="[('user_id','ilike',self)]"/>
+      <field name="device_id"/>
+      <filter string="Needs Push" name="needs_push" domain="[('last_seen', '=', False)]"/>
+      <filter string="On Device" name="synced" domain="[('last_seen', '!=', False)]"/>
+      <filter string="Admin" name="is_admin" domain="[('privilege', '=', '1')]"/>
+    </search>
+  </field>
+</record>
+
+  <!-- Form -->
+  <record id="biometric_device_user_form" model="ir.ui.view">
+    <field name="name">biometric.device.user.form</field>
+    <field name="model">biometric.device.user</field>
+    <field name="arch" type="xml">
+      <form string="Device User">
+        <header>
+
+          <field name="sync_state"
+           widget="statusbar"
+           statusbar_visible="synced,needs_push,unknown"
+           options="{'clickable': False}"
+           invisible="not sync_state"/>
+
+          <button name="action_push_to_device" type="object" class="btn-primary" string="Push to Device"/>
+          <button name="action_delete_on_device" type="object" class="btn-secondary"
+                  string="Delete on Device"
+                  confirm="Remove this user from the device?"/>
+          <button name="action_sync_users" type="object" class="btn-secondary" string="Sync All Users"/>
+          <button name="action_create_employee" type="object" class="btn-secondary"
+            string="Create Employee"
+            invisible="employee_id"/>
+        </header>
+        <sheet>
+          <group>
+            <group string="Identity">
+              <field name="device_id" required="1"/>
+              <field name="user_id" required="1"/>
+              <field name="name" required="1"/>
+              <field name="employee_id"/>
+              <field name="enabled"/>
+            </group>
+            <group string="Credentials">
+              <field name="privilege"/>
+              <field name="password"/>
+              <field name="card_no"/>
+            </group>
+          </group>
+          <group string="Biometrics">
+            <field name="fingerprint_count" readonly="1"/>
+            <field name="face_count" readonly="1"/>
+            <field name="last_seen" readonly="1"/>
+          </group>
+
+          <!-- Optional raw templates fields (hidden by default) -->
+          <group string="Raw Templates" invisible="1">
+            <field name="fingerprint_templates_json" filename="fingerprint_templates.json"/>
+            <field name="face_templates_json" filename="face_templates.json"/>
+          </group>
+        </sheet>
+      </form>
+    </field>
+  </record>
+
+    <!-- Action -->
+  <record id="biometric_device_user_action" model="ir.actions.act_window">
+    <field name="name">Device Users</field>
+    <field name="res_model">biometric.device.user</field>
+    <field name="view_mode">list,form</field>
+    <field name="context">{}</field>
+  </record>
+
+
+</odoo>

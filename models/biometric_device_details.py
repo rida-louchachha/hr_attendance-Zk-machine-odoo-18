@@ -186,28 +186,93 @@ class BiometricDeviceDetails(models.Model):
 
     def action_download_attendance(self):
         """
-        Pull logs from device:
-        - UPSERT raw rows in zk.machine.attendance (create or update if same key),
-        - create/update hr.attendance as in/out pairs (Breaks behave like check in/out),
-        - employee resolution by device_id_num -> name -> create.
+        Pull logs from device and build hr.attendance with overlap-safety.
+
+        Enforcement added:
+          - Each log's user_id must exist as biometric.device.user on THIS device
+            AND be linked to an hr.employee.
+          - The linked employee's name must contain at least two words.
+          - We do NOT auto-create employees here. If something isn't linked, we
+            raise a UserError and stop.
+
+        Other protections preserved:
+          - No duplicate lines at the same time/day (±5s grace).
+          - One open span max per employee per day.
+          - Min duration guard, cool-down after OUT, span extension on OUT, etc.
         """
+        import datetime
+        import pytz
+
         self._require_zk()
         ZkLog = self.env["zk.machine.attendance"].sudo()
         HrAtt = self.env["hr.attendance"].sudo()
-        HrEmployee = self.env["hr.employee"].sudo()
+        Bdu = self.env["biometric.device.user"].sudo()
 
         IN_CODES = {0, 3, 4}  # Check In, Break In, Overtime In
         OUT_CODES = {1, 2, 5}  # Check Out, Break Out, Overtime Out
-        DUP_GRACE = 5  # seconds to collapse repeated same-side punches
 
+        DUP_GRACE_SEC = 5  # ±5s same-side duplicate collapse
+        MIN_DURATION_SEC = 30  # discard spans shorter than this when closing
+        COOLDOWN_AFTER_OUT = 10  # wait N seconds before opening a new IN after a close
+
+        DEVICE_DEFAULT_TZ = "Africa/Casablanca"
+        tzname = getattr(self, "device_tz", False) or DEVICE_DEFAULT_TZ
+        try:
+            dev_tz = pytz.timezone(tzname)
+        except Exception:
+            dev_tz = pytz.timezone(DEVICE_DEFAULT_TZ)
+
+        # --- small helpers -------------------------------------------------------
+        def _to_utc_pair(local_dt):
+            """Return (UTC string, UTC datetime) for a device-local naive datetime."""
+            utc_dt = dev_tz.localize(local_dt, is_dst=None).astimezone(pytz.utc)
+            s = fields.Datetime.to_string(utc_dt)
+            return s, fields.Datetime.to_datetime(s)
+
+        def _tokens(s):
+            s = (s or "").replace("_", " ").replace("-", " ")
+            return [t for t in s.split() if t]
+
+        def _day_bounds(dt_utc):
+            day_start = dt_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + datetime.timedelta(days=1)
+            return fields.Datetime.to_string(day_start), fields.Datetime.to_string(day_end)
+
+        def _find_span_covering_ts(eid, ts_dt):
+            """
+            Return an attendance that ALREADY covers ts_dt (same day):
+            check_in <= ts < check_out (or open span whose check_in <= ts).
+            """
+            day_start, day_end = _day_bounds(ts_dt)
+            recs = HrAtt.search([
+                ('employee_id', '=', eid),
+                ('check_in', '>=', day_start),
+                ('check_in', '<', day_end),
+            ], order='check_in desc')
+            for r in recs:
+                ci = r.check_in and fields.Datetime.to_datetime(r.check_in)
+                co = r.check_out and fields.Datetime.to_datetime(r.check_out)
+                if not ci:
+                    continue
+                if co:
+                    if ci <= ts_dt < co:
+                        return r
+                else:  # open span today
+                    if ci <= ts_dt:
+                        return r
+            return None
+
+        # -------------------------------------------------------------------------
         conn = None
         try:
             conn = self._connect()
             conn.disable_device()
 
-            users = {u.user_id: u for u in (conn.get_users() or [])}
-            logs = conn.get_attendance() or []
-            if not logs:
+            # We only allow building attendance for users that are **already** known
+            # in Odoo under biometric.device.user and properly linked to an employee.
+            # That keeps HR identities clean and avoids single-word names.
+            zk_logs = conn.get_attendance() or []
+            if not zk_logs:
                 return {
                     "type": "ir.actions.client",
                     "tag": "display_notification",
@@ -215,121 +280,179 @@ class BiometricDeviceDetails(models.Model):
                                "type": "warning", "sticky": False},
                 }
 
-            DEVICE_DEFAULT_TZ = "Africa/Casablanca"
-            tzname = getattr(self, "device_tz", False) or DEVICE_DEFAULT_TZ
+            # get all device users once for better messages (optional)
+            dev_users = {u.user_id: u for u in (conn.get_users() or [])}
 
-            last_in_ts, last_out_ts = {}, {}
+            # Process chronologically
+            try:
+                zk_logs.sort(key=lambda r: r.timestamp)
+            except Exception:
+                pass
+
+            # state caches
+            open_att = {}  # emp_id -> open hr.attendance or None
+            last_in_ts = {}  # emp_id -> datetime
+            last_out_ts = {}  # emp_id -> datetime
+            last_closed_out = {}  # emp_id -> datetime
+
+            # seed opens
+            for rec in HrAtt.search([('check_out', '=', False)]):
+                open_att[rec.employee_id.id] = rec
+
             count_upserted = 0
 
-            for log in logs:
-                # ----- time (device local -> UTC) -----
-                try:
-                    dev_tz = pytz.timezone(tzname)
-                except Exception:
-                    dev_tz = pytz.timezone(DEVICE_DEFAULT_TZ)
-                local_dt = dev_tz.localize(log.timestamp, is_dst=None)
-                utc_dt = local_dt.astimezone(pytz.utc)
-                ts = fields.Datetime.to_string(utc_dt)
-                ts_dt = fields.Datetime.to_datetime(ts)
+            for log in zk_logs:
+                ts_str, ts_dt = _to_utc_pair(log.timestamp)
+                win_start = ts_dt - datetime.timedelta(seconds=DUP_GRACE_SEC)
+                win_end = ts_dt + datetime.timedelta(seconds=DUP_GRACE_SEC)
 
-                # ----- raw values -----
-                att_type = str(getattr(log, "status", ""))  # finger/face/card…
-                p_type_str = str(getattr(log, "punch", ""))  # '0'..'5'
+                p_type_str = str(getattr(log, "punch", ""))  # raw punch code
                 try:
                     punch_code = int(p_type_str)
-                except (TypeError, ValueError):
+                except Exception:
                     punch_code = None
 
-                # ----- employee resolution -----
-                dev_user_id_str = str(log.user_id)
-                emp = HrEmployee.search([("device_id_num", "=", dev_user_id_str)], limit=1)
-                if not emp:
-                    dev_user = users.get(log.user_id)
-                    dev_name = (dev_user and (dev_user.name or "").strip()) or ""
-                    if dev_name:
-                        emp = HrEmployee.search([("name", "=", dev_name)], limit=1) or \
-                              HrEmployee.search([("name", "ilike", dev_name)], limit=1)
-                        if emp and not emp.device_id_num:
-                            emp.write({"device_id_num": dev_user_id_str})
-                if not emp:
-                    dev_user = users.get(log.user_id)
-                    new_name = (dev_user.name if dev_user and dev_user.name else dev_user_id_str)
-                    emp = HrEmployee.create({"name": new_name, "device_id_num": dev_user_id_str})
+                uid_str = str(log.user_id)
 
-                # ----- UPSERT raw log -----
-                raw = ZkLog.search([
-                    ("device_id_num", "=", dev_user_id_str),
-                    ("punching_time", "=", ts),
-                ], limit=1)
+                # -------- NEW: resolve only through biometric.device.user ----------
+                bdu = Bdu.search([('device_id', '=', self.id), ('user_id', '=', uid_str)], limit=1)
+                if not bdu or not bdu.employee_id:
+                    # Build clear message with optional device name and user name
+                    u = dev_users.get(log.user_id)
+                    shown = (u and (u.name or '').strip()) or uid_str
+                    raise UserError(_(
+                        "Device user '%s' (ID %s) on device '%s' is not linked to an Employee.\n"
+                        "Open the device users, link (or create) the employee with a full first & last name, "
+                        "then run the download again."
+                    ) % (shown, uid_str, self.name))
+
+                emp = bdu.employee_id
+
+                # Enforce two-word employee name
+                if len(_tokens(emp.name)) < 2:
+                    raise UserError(_(
+                        "Employee '%s' linked to device user ID %s must have at least a first and last name.\n"
+                        "Please correct the name, then retry."
+                    ) % (emp.name or "", uid_str))
+
+                # keep device_id_num consistent (do not overwrite if different; only fill if empty)
+                if not emp.device_id_num:
+                    emp.write({'device_id_num': uid_str})
+
+                eid = emp.id
+                if eid not in open_att:
+                    open_att[eid] = None
+                if eid not in last_closed_out:
+                    last_closed = HrAtt.search([('employee_id', '=', eid), ('check_out', '!=', False)],
+                                               order='check_out desc', limit=1)
+                    last_closed_out[eid] = last_closed.check_out and fields.Datetime.to_datetime(last_closed.check_out)
+
+                # Upsert raw table for analysis
+                raw = ZkLog.search([("device_id_num", "=", uid_str), ("punching_time", "=", ts_str)], limit=1)
                 raw_vals = {
-                    "employee_id": emp.id,
-                    "device_id_num": dev_user_id_str,
-                    "punching_time": ts,
-                    "attendance_type": att_type,
+                    "employee_id": eid,
+                    "device_id_num": uid_str,
+                    "punching_time": ts_str,
+                    "attendance_type": str(getattr(log, "status", "")),
                     "punch_type": p_type_str,
                     "punch": punch_code,
                     "device_ref_id": self.id,
                     "address_id": self.working_address.id if getattr(self, "working_address", False) else False,
                 }
                 (raw and raw.write(raw_vals)) or ZkLog.create(raw_vals)
-
-                # ----- hr.attendance logic (Breaks == Check Ins/Outs) -----
-                win_start = fields.Datetime.to_string(ts_dt - datetime.timedelta(seconds=DUP_GRACE))
-                win_end = fields.Datetime.to_string(ts_dt + datetime.timedelta(seconds=DUP_GRACE))
-
-                if punch_code in IN_CODES:
-                    # duplicate-IN grace
-                    li = last_in_ts.get(emp.id)
-                    if li and abs((ts_dt - li).total_seconds()) <= DUP_GRACE:
-                        _logger.debug("Skip duplicate IN (grace) for emp %s @ %s", emp.id, ts)
-                    else:
-                        # CHANGED: if an IN arrives while another IN is already open -> ignore (no split)
-                        open_att = HrAtt.search([
-                            ('employee_id', '=', emp.id),
-                            ('check_out', '=', False),
-                        ], order='check_in desc', limit=1)
-
-                        same_in = HrAtt.search([
-                            ('employee_id', '=', emp.id),
-                            ('check_in', '>=', win_start),
-                            ('check_in', '<=', win_end),
-                        ], limit=1)
-
-                        if not open_att and not same_in:
-                            try:
-                                HrAtt.create({'employee_id': emp.id, 'check_in': ts})
-                            except ValidationError:
-                                _logger.debug("Conflicting IN for emp %s @ %s", emp.id, ts)
-
-                    last_in_ts[emp.id] = ts_dt
-
-                elif punch_code in OUT_CODES:
-                    # duplicate-OUT grace
-                    lo = last_out_ts.get(emp.id)
-                    if lo and abs((ts_dt - lo).total_seconds()) <= DUP_GRACE:
-                        _logger.debug("Skip duplicate OUT (grace) for emp %s @ %s", emp.id, ts)
-                    else:
-                        open_att = HrAtt.search([
-                            ('employee_id', '=', emp.id),
-                            ('check_out', '=', False),
-                        ], order='check_in desc', limit=1)
-
-                        if open_att:
-                            if not (open_att.check_out and win_start <= fields.Datetime.to_string(
-                                    open_att.check_out) <= win_end):
-                                if not open_att.check_in or ts_dt >= open_att.check_in:
-                                    try:
-                                        open_att.write({'check_out': ts})
-                                    except ValidationError:
-                                        _logger.debug("Conflicting OUT for emp %s @ %s", emp.id, ts)
-                        else:
-                            # CHANGED: do NOT create zero-length pairs for stray OUTs
-                            _logger.debug("Stray OUT for emp %s @ %s -> ignored (no open IN).", emp.id, ts)
-
-                    last_out_ts[emp.id] = ts_dt
-
                 count_upserted += 1
 
+                # -------------------- IN (open) --------------------
+                if punch_code in IN_CODES:
+                    li = last_in_ts.get(eid)
+                    if li and abs((ts_dt - li).total_seconds()) <= DUP_GRACE_SEC:
+                        continue  # duplicate IN
+
+                    cover = _find_span_covering_ts(eid, ts_dt)
+                    if cover:
+                        if not cover.check_out:
+                            open_att[eid] = cover
+                        last_in_ts[eid] = ts_dt
+                        continue
+
+                    if open_att[eid]:
+                        last_in_ts[eid] = ts_dt
+                        continue
+
+                    lc = last_closed_out.get(eid)
+                    if lc and (ts_dt - lc) <= datetime.timedelta(seconds=COOLDOWN_AFTER_OUT):
+                        last_in_ts[eid] = ts_dt
+                        continue
+
+                    same_in = HrAtt.search([
+                        ('employee_id', '=', eid),
+                        ('check_in', '>=', fields.Datetime.to_string(win_start)),
+                        ('check_in', '<=', fields.Datetime.to_string(win_end)),
+                    ], limit=1)
+                    if same_in:
+                        if not same_in.check_out:
+                            open_att[eid] = same_in
+                        last_in_ts[eid] = ts_dt
+                        continue
+
+                    open_att[eid] = HrAtt.create({'employee_id': eid, 'check_in': ts_str})
+                    last_in_ts[eid] = ts_dt
+
+                # -------------------- OUT (close) --------------------
+                elif punch_code in OUT_CODES:
+                    lo = last_out_ts.get(eid)
+                    if lo and abs((ts_dt - lo).total_seconds()) <= DUP_GRACE_SEC:
+                        continue  # duplicate OUT
+
+                    att = open_att.get(eid)
+
+                    if not att:
+                        cover = _find_span_covering_ts(eid, ts_dt)
+                        if cover:
+                            last_out_ts[eid] = ts_dt
+                            continue
+
+                        day_start, day_end = _day_bounds(ts_dt)
+                        last_today = HrAtt.search([
+                            ('employee_id', '=', eid),
+                            ('check_in', '>=', day_start),
+                            ('check_in', '<', day_end),
+                        ], order='check_in desc', limit=1)
+
+                        if last_today and last_today.check_in:
+                            ci = fields.Datetime.to_datetime(last_today.check_in)
+                            co = last_today.check_out and fields.Datetime.to_datetime(last_today.check_out)
+                            if ts_dt >= ci and (not co or ts_dt > co):
+                                adj_out = ts_dt
+                                if co and adj_out <= co:
+                                    adj_out = co + datetime.timedelta(seconds=1)
+                                dur = (adj_out - ci).total_seconds()
+                                if not MIN_DURATION_SEC or dur >= MIN_DURATION_SEC:
+                                    last_today.write({'check_out': fields.Datetime.to_string(adj_out)})
+                                    last_closed_out[eid] = adj_out
+                        last_out_ts[eid] = ts_dt
+                        continue
+
+                    ci_dt = att.check_in and fields.Datetime.to_datetime(att.check_in)
+                    if ci_dt:
+                        out_dt = ts_dt
+                        if out_dt <= ci_dt:
+                            out_dt = ci_dt + datetime.timedelta(seconds=1)
+
+                        duration = (out_dt - ci_dt).total_seconds()
+                        if MIN_DURATION_SEC and duration < MIN_DURATION_SEC:
+                            att.unlink()
+                            open_att[eid] = None
+                            last_out_ts[eid] = ts_dt
+                            continue
+
+                        att.write({'check_out': fields.Datetime.to_string(out_dt)})
+                        last_closed_out[eid] = out_dt
+                        open_att[eid] = None
+
+                    last_out_ts[eid] = ts_dt
+
+            # success toast
             return {
                 "type": "ir.actions.client",
                 "tag": "display_notification",
@@ -340,12 +463,11 @@ class BiometricDeviceDetails(models.Model):
                 },
             }
 
-        except ValidationError as ve:
-            _logger.info("Attendance duplicates/overlaps skipped: %s", ve)
+        except ValidationError:
             return {
                 "type": "ir.actions.client",
                 "tag": "display_notification",
-                "params": {"message": _("Attendance download completed (duplicates skipped)."),
+                "params": {"message": _("Attendance download completed (overlaps skipped)."),
                            "type": "success", "sticky": False},
             }
         except Exception as e:
@@ -371,3 +493,20 @@ class BiometricDeviceDetails(models.Model):
             raise UserError(_("Failed to restart device: %s") % e)
         finally:
             self._safe_disconnect(conn)
+
+    def action_open_device_users(self):
+        """Sync users for THIS device, then open the list filtered to it."""
+        self.ensure_one()
+        # reuse the users model's sync, but scoped to this device
+        self.env['biometric.device.user'].with_context(sync_devices=[self.id]).action_sync_users()
+        return {
+            "type": "ir.actions.act_window",
+            "name": _("Device Users"),
+            "res_model": "biometric.device.user",
+            "view_mode": "list,form",
+            "domain": [("device_id", "=", self.id)],
+            "context": {
+                "default_device_id": self.id,
+                "search_default_device_id": self.id,
+            },
+        }

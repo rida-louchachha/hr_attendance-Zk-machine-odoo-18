@@ -21,4 +21,17 @@
               action="daily_attendance_action"
               sequence="20"
               groups="hr_attendance.group_hr_attendance_officer"/>
+
+      <!-- Menu (under your existing Biometric menu) -->
+  <menuitem id="menu_bio_config_root"
+            name="Configurations"
+            parent="menu_biometric_root"
+            sequence="21"/>
+
+  <menuitem id="menu_bio_device_users"
+            name="Device Users"
+            parent="menu_bio_config_root"
+            action="biometric_device_user_action"
+            sequence="1"/>
+
 </odoo>
